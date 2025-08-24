@@ -1,0 +1,13 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "deploy": {
+    "startCommand": "mcpo proxy --base-url 0.0.0.0:8000 --forward-to https://mcp.composio.dev/",
+    "healthcheckPath": "/",
+    "variables": {
+      "X_API_KEY": "your_composio_api_key_here"
+    }
+  }
+}
