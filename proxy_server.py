@@ -304,7 +304,7 @@ def proxy_request(path=''):
         return '', 200
     
     # Don't proxy specific endpoints we handle locally
-    if path in ['api/tools', 'mcp/ws', 'models']:
+    if path in ['api/tools', 'mcp/ws', 'models', 'v1/models']:
         return jsonify({
             "error": "Route handling error",
             "message": "This endpoint should be handled by a specific route, not the proxy"
