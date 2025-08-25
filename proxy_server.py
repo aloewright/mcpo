@@ -245,6 +245,13 @@ def proxy_request(path=''):
     if request.method == 'OPTIONS':
         return '', 200
     
+    # Don't proxy specific endpoints we handle locally
+    if path in ['api/tools', 'mcp/ws']:
+        return jsonify({
+            "error": "Route handling error",
+            "message": "This endpoint should be handled by a specific route, not the proxy"
+        }), 500
+    
     start_time = time.time()
     
     try:
