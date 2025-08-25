@@ -14,7 +14,7 @@ import os
 import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from flask import Flask, request, Response, jsonify, stream_with_context
+from flask import Flask, request, Response, jsonify, stream_with_context, make_response
 from flask_cors import CORS
 import requests
 from werkzeug.exceptions import BadRequest, InternalServerError
@@ -387,6 +387,111 @@ def v1_models_endpoint():
     return response, 200
 
 
+@app.route('/openapi.tools.json', methods=['GET', 'OPTIONS'])
+def dynamic_tools_openapi():
+    """Dynamically generate an OpenAPI spec exposing each Composio tool as a POST endpoint.
+    This allows Open WebUI (OpenAPI-only tools) to list and call tools directly.
+    """
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    api_key = extract_api_key_from_request() or DEFAULT_API_KEY
+    if not api_key:
+        return jsonify({"error": "Authentication required", "message": "Provide API key in Authorization: Bearer <key> header"}), 401
+
+    try:
+        tools = _fetch_all_tools(api_key, max_apps=None).get('items', [])
+        base_url = request.url_root.rstrip('/')
+        paths: Dict[str, Any] = {}
+        for t in tools:
+            slug = t.get('slug') or t.get('name')
+            if not slug:
+                continue
+            params_schema = t.get('input_parameters') or {"type": "object"}
+            resp_schema = t.get('output_parameters') or {"type": "object"}
+            op = {
+                "operationId": f"invoke_{slug.lower()}",
+                "summary": t.get('name') or slug,
+                "description": t.get('description') or f"Invoke {slug}",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": params_schema
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Invocation result",
+                        "content": {
+                            "application/json": {
+                                "schema": resp_schema
+                            }
+                        }
+                    },
+                    "default": {
+                        "description": "Error response",
+                        "content": {"application/json": {"schema": {"type": "object"}}}
+                    }
+                }
+            }
+            paths[f"/openapi/tools/{slug}"] = {"post": op}
+
+        spec = {
+            "openapi": "3.1.0",
+            "info": {"title": "Composio Tools via Proxy", "version": "1.0.0"},
+            "servers": [{"url": base_url, "description": "Proxy base"}],
+            "paths": paths,
+            "components": {"securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}}},
+            "security": [{"bearerAuth": []}]
+        }
+        resp = jsonify(spec)
+        resp.headers['Cache-Control'] = 'public, max-age=120'
+        return resp, 200
+    except Exception as e:
+        logger.error(f"Failed to generate tools OpenAPI: {e}")
+        return jsonify({"error": "Failed to generate OpenAPI", "message": str(e)}), 500
+
+
+@app.route('/openapi/tools/<slug>', methods=['POST', 'OPTIONS'])
+def openapi_tool_invoke(slug: str):
+    """Invoke a specific tool by slug, translating to Composio execute endpoint.
+    We infer the app key from the tool's toolkit.slug; if not found, return error.
+    """
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    api_key = extract_api_key_from_request() or DEFAULT_API_KEY
+    if not api_key:
+        return jsonify({"error": "Authentication required", "message": "Provide API key in Authorization: Bearer <key> header"}), 401
+
+    try:
+        # Find tool metadata
+        tools = _fetch_all_tools(api_key, max_apps=None).get('items', [])
+        tool = next((t for t in tools if (t.get('slug') or '').lower() == slug.lower()), None)
+        if not tool:
+            return jsonify({"error": "Not found", "message": f"Tool '{slug}' not found"}), 404
+        toolkit = tool.get('toolkit') or {}
+        app_key = toolkit.get('slug') or toolkit.get('name')
+        if not app_key:
+            return jsonify({"error": "Unknown app", "message": f"No app/toolkit info for tool '{slug}'"}), 400
+
+        # Forward to assumed Composio execute endpoint
+        target = f"{COMPOSIO_BASE_URL}/api/apps/{app_key}/tools/{slug}/execute"
+        headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+        upstream = requests.post(target, headers=headers, data=request.data, timeout=(CONNECTION_TIMEOUT, REQUEST_TIMEOUT))
+        # Pass through status and JSON body
+        try:
+            body = upstream.json()
+        except Exception:
+            body = {"raw": upstream.text}
+        return make_response(jsonify(body), upstream.status_code)
+    except Exception as e:
+        logger.error(f"Tool invoke failed for {slug}: {e}")
+        return jsonify({"error": "Invoke failed", "message": str(e)}), 500
+
+
 @app.route('/mcp/ws', methods=['GET', 'OPTIONS'])
 def legacy_sse_notice():
     """Provide a helpful message for clients trying to use deprecated SSE routes."""
@@ -407,7 +512,7 @@ def proxy_request(path=''):
         return '', 200
     
     # Don't proxy specific endpoints we handle locally
-    if path in ['api/tools', 'mcp/ws', 'models', 'v1/models', 'openapi.json', 'tools', 'api/tools/manifest', 'tools/manifest']:
+    if path in ['api/tools', 'mcp/ws', 'models', 'v1/models', 'openapi.json', 'tools', 'api/tools/manifest', 'tools/manifest', 'openapi.tools.json'] or path.startswith('openapi/tools/'):
         return jsonify({
             "error": "Route handling error",
             "message": "This endpoint should be handled by a specific route, not the proxy"
