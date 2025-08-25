@@ -1,4 +1,3 @@
-print("=== MCPO Proxy Starting Up ===")
 #!/usr/bin/env python3
 """
 Custom proxy server for bridging Open WebUI to Composio MCP API.
