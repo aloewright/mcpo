@@ -13,6 +13,7 @@ This server:
 import os
 import logging
 import time
+from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, request, Response, jsonify, stream_with_context
 from flask_cors import CORS
 import requests
@@ -40,6 +41,10 @@ PORT = int(os.getenv('PORT', 8000))
 # Request timeout settings
 REQUEST_TIMEOUT = 120
 CONNECTION_TIMEOUT = 30
+
+# Simple in-memory cache for expensive aggregations (e.g., tools listing)
+_TOOLS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+TOOLS_CACHE_TTL_SECONDS = int(os.getenv('TOOLS_CACHE_TTL_SECONDS', '120'))  # 2 minutes default
 
 # Add performance headers to all responses
 @app.after_request
@@ -111,6 +116,69 @@ def extract_api_key_from_request():
         logger.warning("No API key found in Authorization header and no default configured")
         return None
 
+
+def _get_with_auth(path: str, api_key: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+    """Helper to GET from Composio with x-api-key and standard timeouts."""
+    url = f"{COMPOSIO_BASE_URL}{path if path.startswith('/') else '/' + path}"
+    headers = {
+        'x-api-key': api_key,
+        # propagate a minimal set of client hints for troubleshooting
+        'X-Client': 'composio-proxy',
+    }
+    return requests.get(url, headers=headers, params=params, timeout=(CONNECTION_TIMEOUT, REQUEST_TIMEOUT))
+
+
+def _fetch_all_tools(api_key: str) -> Dict[str, Any]:
+    """Aggregate tools across all apps into a single list compatible with older clients.
+    Returns a dict like {"items": [...]}.
+    Uses a short-lived in-memory cache keyed by api_key.
+    """
+    now = time.time()
+    cache_key = f"tools::{api_key[:6]}::{TOOLS_CACHE_TTL_SECONDS}"
+    cached = _TOOLS_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < TOOLS_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    # 1) fetch apps
+    apps_resp = _get_with_auth('/api/apps', api_key)
+    if apps_resp.status_code != 200:
+        raise InternalServerError(f"Upstream /api/apps returned {apps_resp.status_code}")
+    apps = apps_resp.json()
+    if isinstance(apps, dict) and 'items' in apps:
+        apps_list = apps['items']
+    else:
+        # Some deployments return a plain array
+        apps_list = apps if isinstance(apps, list) else []
+
+    aggregated: List[Dict[str, Any]] = []
+    for app in apps_list:
+        app_key = app.get('key') or app.get('slug') or app.get('id')
+        if not app_key:
+            continue
+        try:
+            tools_resp = _get_with_auth(f"/api/apps/{app_key}/tools/list", api_key)
+            if tools_resp.status_code != 200:
+                logger.warning(f"Skipping tools for {app_key}: {tools_resp.status_code}")
+                continue
+            tools_json = tools_resp.json()
+            items = tools_json.get('items', []) if isinstance(tools_json, dict) else []
+            # Ensure toolkit slug/name present; inject if missing from app
+            for t in items:
+                tk = t.get('toolkit') or {}
+                if not tk:
+                    t['toolkit'] = {
+                        'slug': app.get('key') or app.get('slug') or 'unknown',
+                        'name': app.get('name') or (app.get('key') or 'unknown')
+                    }
+            aggregated.extend(items)
+        except Exception as e:
+            logger.warning(f"Error fetching tools for app {app_key}: {e}")
+            continue
+
+    result = {"items": aggregated}
+    _TOOLS_CACHE[cache_key] = (now, result)
+    return result
+
 def sanitize_headers_for_logging(headers):
     """Sanitize headers for logging by removing sensitive information."""
     sanitized = dict(headers)
@@ -125,6 +193,47 @@ def sanitize_headers_for_logging(headers):
             sanitized[header_lower] = '[REDACTED]'
     
     return sanitized
+
+@app.route('/api/tools', methods=['GET', 'OPTIONS'])
+def legacy_tools_endpoint():
+    """Compatibility endpoint for clients expecting /api/tools.
+    Aggregates tools across all apps and returns a single items list.
+    """
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    api_key = extract_api_key_from_request()
+    if not api_key:
+        return jsonify({
+            "error": "Authentication required",
+            "message": "Provide API key in Authorization: Bearer <key> header"
+        }), 401
+
+    try:
+        start = time.time()
+        data = _fetch_all_tools(api_key)
+        duration = time.time() - start
+        logger.info(f"/api/tools aggregated {len(data.get('items', []))} tools in {duration:.2f}s")
+        # Cache-friendly headers
+        resp = jsonify(data)
+        resp.headers['Cache-Control'] = f"public, max-age={TOOLS_CACHE_TTL_SECONDS}"
+        return resp, 200
+    except Exception as e:
+        logger.error(f"Failed to aggregate tools: {e}")
+        return jsonify({
+            "error": "Upstream error",
+            "message": str(e)
+        }), 502
+
+
+@app.route('/mcp/ws', methods=['GET'])
+def legacy_sse_notice():
+    """Provide a helpful message for clients trying to use deprecated SSE routes."""
+    return jsonify({
+        "error": "SSE is obsolete. Please upgrade your client to latest version or use /api/tools for listing tools.",
+        "hint": "This proxy exposes a compatibility /api/tools endpoint for older clients."
+    }), 400
+
 
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
 def proxy_request(path=''):
