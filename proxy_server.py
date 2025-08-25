@@ -41,14 +41,37 @@ PORT = int(os.getenv('PORT', 8000))
 REQUEST_TIMEOUT = 120
 CONNECTION_TIMEOUT = 30
 
+# Add performance headers to all responses
+@app.after_request
+def add_performance_headers(response):
+    """Add performance and security headers to all responses."""
+    # Add connection keep-alive for better performance
+    response.headers['Connection'] = 'keep-alive'
+    
+    # Add security headers
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    
+    # Add caching for static/health endpoints
+    if request.endpoint in ['health_check', 'detailed_health']:
+        response.headers['Cache-Control'] = 'public, max-age=30'
+    elif request.path == '/openapi.json':
+        response.headers['Cache-Control'] = 'public, max-age=300'  # 5 minutes
+    
+    return response
+
 @app.route('/', methods=['GET'])
 def health_check():
     """Health check endpoint for Railway."""
-    return jsonify({
+    response = jsonify({
         "status": "healthy",
         "service": "composio-proxy",
         "timestamp": int(time.time())
-    }), 200
+    })
+    # Add cache headers for faster subsequent requests
+    response.headers['Cache-Control'] = 'public, max-age=30'
+    response.headers['Connection'] = 'keep-alive'
+    return response, 200
 
 @app.route('/health', methods=['GET'])
 def detailed_health():
