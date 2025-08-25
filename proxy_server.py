@@ -34,7 +34,7 @@ CORS(app, origins="*", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTION
 
 # Configuration
 COMPOSIO_BASE_URL = "https://mcp.composio.dev"
-DEFAULT_API_KEY = os.getenv('COMPOSIO_API_KEY', '')
+DEFAULT_API_KEY = os.getenv('X_API_KEY', '')
 PORT = int(os.getenv('PORT', 8000))
 
 # Request timeout settings
