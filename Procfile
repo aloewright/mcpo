@@ -1,0 +1,1 @@
+web: gunicorn proxy_server:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --worker-class gthread --timeout 30 --keep-alive 5 --max-requests 1000 --max-requests-jitter 100 --preload --access-logfile - --error-logfile -
