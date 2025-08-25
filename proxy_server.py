@@ -226,6 +226,31 @@ def legacy_tools_endpoint():
         }), 502
 
 
+@app.route('/models', methods=['GET', 'OPTIONS'])
+def models_endpoint():
+    """MCP models endpoint - returns available models for Open WebUI.
+    Since Composio is a tools/actions provider, we return a placeholder model list.
+    """
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    # Return a basic model response that Open WebUI expects
+    return jsonify({
+        "data": [
+            {
+                "id": "composio-tools",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "composio",
+                "permission": [],
+                "root": "composio-tools",
+                "parent": None
+            }
+        ],
+        "object": "list"
+    }), 200
+
+
 @app.route('/mcp/ws', methods=['GET', 'OPTIONS'])
 def legacy_sse_notice():
     """Provide a helpful message for clients trying to use deprecated SSE routes."""
@@ -246,7 +271,7 @@ def proxy_request(path=''):
         return '', 200
     
     # Don't proxy specific endpoints we handle locally
-    if path in ['api/tools', 'mcp/ws']:
+    if path in ['api/tools', 'mcp/ws', 'models']:
         return jsonify({
             "error": "Route handling error",
             "message": "This endpoint should be handled by a specific route, not the proxy"
