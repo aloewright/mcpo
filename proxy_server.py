@@ -230,12 +230,14 @@ def legacy_tools_endpoint():
 def models_endpoint():
     """MCP models endpoint - returns available models for Open WebUI.
     Since Composio is a tools/actions provider, we return a placeholder model list.
+    No authentication required for model discovery.
     """
     if request.method == 'OPTIONS':
         return '', 200
     
     # Return a basic model response that Open WebUI expects
-    return jsonify({
+    # This doesn't require authentication as it's just metadata
+    response = jsonify({
         "data": [
             {
                 "id": "composio-tools",
@@ -248,7 +250,9 @@ def models_endpoint():
             }
         ],
         "object": "list"
-    }), 200
+    })
+    response.headers['Cache-Control'] = 'public, max-age=300'  # Cache for 5 minutes
+    return response, 200
 
 
 @app.route('/mcp/ws', methods=['GET', 'OPTIONS'])
