@@ -45,6 +45,8 @@ CONNECTION_TIMEOUT = 30
 # Simple in-memory cache for expensive aggregations (e.g., tools listing)
 _TOOLS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 TOOLS_CACHE_TTL_SECONDS = int(os.getenv('TOOLS_CACHE_TTL_SECONDS', '120'))  # 2 minutes default
+# Limit initial aggregation size to reduce cold connect latency (tunable)
+TOOLS_MAX_APPS = int(os.getenv('TOOLS_MAX_APPS', '25'))
 
 # Add performance headers to all responses
 @app.after_request
@@ -128,13 +130,13 @@ def _get_with_auth(path: str, api_key: str, params: Optional[Dict[str, Any]] = N
     return requests.get(url, headers=headers, params=params, timeout=(CONNECTION_TIMEOUT, REQUEST_TIMEOUT))
 
 
-def _fetch_all_tools(api_key: str) -> Dict[str, Any]:
+def _fetch_all_tools(api_key: str, max_apps: Optional[int] = None) -> Dict[str, Any]:
     """Aggregate tools across all apps into a single list compatible with older clients.
     Returns a dict like {"items": [...]}.
     Uses a short-lived in-memory cache keyed by api_key.
     """
     now = time.time()
-    cache_key = f"tools::{api_key[:6]}::{TOOLS_CACHE_TTL_SECONDS}"
+    cache_key = f"tools::{api_key[:6]}::{TOOLS_CACHE_TTL_SECONDS}::{max_apps or 'all'}"
     cached = _TOOLS_CACHE.get(cache_key)
     if cached and (now - cached[0]) < TOOLS_CACHE_TTL_SECONDS:
         return cached[1]
@@ -151,6 +153,9 @@ def _fetch_all_tools(api_key: str) -> Dict[str, Any]:
         apps_list = apps if isinstance(apps, list) else []
 
     aggregated: List[Dict[str, Any]] = []
+    if max_apps is not None and isinstance(max_apps, int) and max_apps > 0:
+        apps_list = apps_list[:max_apps]
+
     for app in apps_list:
         app_key = app.get('key') or app.get('slug') or app.get('id')
         if not app_key:
@@ -211,7 +216,8 @@ def legacy_tools_endpoint():
 
     try:
         start = time.time()
-        data = _fetch_all_tools(api_key)
+        # limit initial aggregation to speed up connect; clients can request more later
+        data = _fetch_all_tools(api_key, max_apps=TOOLS_MAX_APPS)
         duration = time.time() - start
         logger.info(f"/api/tools aggregated {len(data.get('items', []))} tools in {duration:.2f}s")
         # Cache-friendly headers
@@ -252,6 +258,29 @@ def models_endpoint():
         "object": "list"
     })
     response.headers['Cache-Control'] = 'public, max-age=300'  # Cache for 5 minutes
+    return response, 200
+
+
+@app.route('/v1/models', methods=['GET', 'OPTIONS'])
+def v1_models_endpoint():
+    """OpenAI-compatible models endpoint for broader client compatibility."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    response = jsonify({
+        "data": [
+            {
+                "id": "composio-tools",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "composio",
+                "permission": [],
+                "root": "composio-tools",
+                "parent": None
+            }
+        ],
+        "object": "list"
+    })
+    response.headers['Cache-Control'] = 'public, max-age=300'
     return response, 200
 
 
