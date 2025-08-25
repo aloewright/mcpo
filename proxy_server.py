@@ -31,7 +31,13 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Enable CORS for all routes (needed for Open WebUI)
-CORS(app, origins="*", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+CORS(
+    app,
+    origins="*",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "x-api-key"],
+    expose_headers=["Content-Type"],
+)
 
 # Configuration
 COMPOSIO_BASE_URL = "https://mcp.composio.dev"
@@ -199,6 +205,39 @@ def sanitize_headers_for_logging(headers):
     
     return sanitized
 
+@app.route('/openapi.json', methods=['GET', 'OPTIONS'])
+def openapi_endpoint():
+    """Serve OpenAPI schema with server URL rewritten to this proxy's absolute URL.
+    Allows unauthenticated access for client discovery.
+    """
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    try:
+        # Fetch upstream openapi
+        upstream = requests.get(
+            f"{COMPOSIO_BASE_URL}/openapi.json",
+            headers={"x-api-key": DEFAULT_API_KEY} if DEFAULT_API_KEY else None,
+            timeout=(CONNECTION_TIMEOUT, REQUEST_TIMEOUT),
+        )
+        upstream.raise_for_status()
+        data = upstream.json()
+
+        # Rewrite servers to absolute URL of this proxy
+        base_url = request.url_root.rstrip('/')
+        data['servers'] = [
+            {"url": base_url, "description": "Proxy base"},
+            {"url": "/", "description": "Relative (upstream default)"},
+        ]
+
+        resp = jsonify(data)
+        resp.headers['Cache-Control'] = 'public, max-age=300'
+        return resp, 200
+    except Exception as e:
+        logger.error(f"Failed to serve openapi.json: {e}")
+        return jsonify({"error": "OpenAPI fetch failed", "message": str(e)}), 502
+
+
 @app.route('/api/tools', methods=['GET', 'OPTIONS'])
 def legacy_tools_endpoint():
     """Compatibility endpoint for clients expecting /api/tools.
@@ -304,7 +343,7 @@ def proxy_request(path=''):
         return '', 200
     
     # Don't proxy specific endpoints we handle locally
-    if path in ['api/tools', 'mcp/ws', 'models', 'v1/models']:
+    if path in ['api/tools', 'mcp/ws', 'models', 'v1/models', 'openapi.json']:
         return jsonify({
             "error": "Route handling error",
             "message": "This endpoint should be handled by a specific route, not the proxy"
