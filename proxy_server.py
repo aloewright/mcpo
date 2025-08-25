@@ -114,14 +114,19 @@ def proxy_request(path=''):
     start_time = time.time()
     
     try:
-        # Extract API key from request
-        api_key = extract_api_key_from_request()
-        if not api_key:
-            logger.error("No API key provided in request")
-            return jsonify({
-                "error": "Authentication required",
-                "message": "Provide API key in Authorization: Bearer <key> header"
-            }), 401
+        # Allow unauthenticated access to openapi.json for Open WebUI integration
+        if path == 'openapi.json' and request.method == 'GET':
+            api_key = DEFAULT_API_KEY or 'anonymous'
+            logger.info(f"Allowing unauthenticated access to /openapi.json")
+        else:
+            # Extract API key from request for other endpoints
+            api_key = extract_api_key_from_request()
+            if not api_key:
+                logger.error("No API key provided in request")
+                return jsonify({
+                    "error": "Authentication required",
+                    "message": "Provide API key in Authorization: Bearer <key> header"
+                }), 401
         
         # Build target URL
         target_url = f"{COMPOSIO_BASE_URL}/{path}"
