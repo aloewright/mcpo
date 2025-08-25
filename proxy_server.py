@@ -226,13 +226,15 @@ def legacy_tools_endpoint():
         }), 502
 
 
-@app.route('/mcp/ws', methods=['GET'])
+@app.route('/mcp/ws', methods=['GET', 'OPTIONS'])
 def legacy_sse_notice():
     """Provide a helpful message for clients trying to use deprecated SSE routes."""
+    if request.method == 'OPTIONS':
+        return '', 200
     return jsonify({
         "error": "SSE is obsolete. Please upgrade your client to latest version or use /api/tools for listing tools.",
         "hint": "This proxy exposes a compatibility /api/tools endpoint for older clients."
-    }), 400
+    }), 410  # Gone status for obsolete endpoints
 
 
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
