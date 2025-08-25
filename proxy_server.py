@@ -238,10 +238,41 @@ def openapi_endpoint():
         return jsonify({"error": "OpenAPI fetch failed", "message": str(e)}), 502
 
 
+def _format_tools_manifest(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return a manifest that matches common tool formats (OpenAI, generic)."""
+    tools_as_functions = []
+    tools_simple = []
+    for t in items:
+        slug = t.get('slug') or t.get('name')
+        title = t.get('name') or slug
+        desc = t.get('description') or ''
+        params = t.get('input_parameters') or {"type": "object", "properties": {}}
+        tools_as_functions.append({
+            "type": "function",
+            "function": {
+                "name": slug,
+                "description": desc or title,
+                "parameters": params
+            }
+        })
+        tools_simple.append({
+            "name": slug,
+            "title": title,
+            "description": desc,
+            "parameters": params
+        })
+    return {
+        "items": items,
+        "tools": tools_simple,
+        "openai_tools": tools_as_functions,
+        "count": len(items)
+    }
+
+
 @app.route('/api/tools', methods=['GET', 'OPTIONS'])
 def legacy_tools_endpoint():
     """Compatibility endpoint for clients expecting /api/tools.
-    Aggregates tools across all apps and returns a single items list.
+    Aggregates tools across all apps and returns multiple shapes for compatibility.
     """
     if request.method == 'OPTIONS':
         return '', 200
@@ -259,12 +290,45 @@ def legacy_tools_endpoint():
         data = _fetch_all_tools(api_key, max_apps=TOOLS_MAX_APPS)
         duration = time.time() - start
         logger.info(f"/api/tools aggregated {len(data.get('items', []))} tools in {duration:.2f}s")
+        manifest = _format_tools_manifest(data.get('items', []))
         # Cache-friendly headers
-        resp = jsonify(data)
+        resp = jsonify(manifest)
         resp.headers['Cache-Control'] = f"public, max-age={TOOLS_CACHE_TTL_SECONDS}"
         return resp, 200
     except Exception as e:
         logger.error(f"Failed to aggregate tools: {e}")
+        return jsonify({
+            "error": "Upstream error",
+            "message": str(e)
+        }), 502
+
+
+@app.route('/tools', methods=['GET', 'OPTIONS'])
+@app.route('/api/tools/manifest', methods=['GET', 'OPTIONS'])
+@app.route('/tools/manifest', methods=['GET', 'OPTIONS'])
+def tools_manifest_endpoint():
+    """Expose tools with multiple shapes (/tools, /api/tools/manifest, /tools/manifest)."""
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    api_key = extract_api_key_from_request()
+    if not api_key:
+        return jsonify({
+            "error": "Authentication required",
+            "message": "Provide API key in Authorization: Bearer <key> header"
+        }), 401
+
+    try:
+        start = time.time()
+        data = _fetch_all_tools(api_key, max_apps=TOOLS_MAX_APPS)
+        duration = time.time() - start
+        logger.info(f"{request.path} aggregated {len(data.get('items', []))} tools in {duration:.2f}s")
+        manifest = _format_tools_manifest(data.get('items', []))
+        resp = jsonify(manifest)
+        resp.headers['Cache-Control'] = f"public, max-age={TOOLS_CACHE_TTL_SECONDS}"
+        return resp, 200
+    except Exception as e:
+        logger.error(f"Failed to aggregate tools (manifest): {e}")
         return jsonify({
             "error": "Upstream error",
             "message": str(e)
@@ -343,7 +407,7 @@ def proxy_request(path=''):
         return '', 200
     
     # Don't proxy specific endpoints we handle locally
-    if path in ['api/tools', 'mcp/ws', 'models', 'v1/models', 'openapi.json']:
+    if path in ['api/tools', 'mcp/ws', 'models', 'v1/models', 'openapi.json', 'tools', 'api/tools/manifest', 'tools/manifest']:
         return jsonify({
             "error": "Route handling error",
             "message": "This endpoint should be handled by a specific route, not the proxy"
