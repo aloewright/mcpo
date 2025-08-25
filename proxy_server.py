@@ -17,7 +17,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, request, Response, jsonify, stream_with_context, make_response
 from flask_cors import CORS
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from werkzeug.exceptions import BadRequest, InternalServerError
+from functools import lru_cache
+import threading
 
 # Configure logging
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -41,18 +45,57 @@ CORS(
 
 # Configuration
 COMPOSIO_BASE_URL = "https://mcp.composio.dev"
+COMPOSIO_BACKEND_BASE = os.getenv('COMPOSIO_BACKEND_BASE', 'https://backend.composio.dev')
 DEFAULT_API_KEY = os.getenv('X_API_KEY', '')
 PORT = int(os.getenv('PORT', 8000))
 
 # Request timeout settings
-REQUEST_TIMEOUT = 120
-CONNECTION_TIMEOUT = 30
+REQUEST_TIMEOUT = 60  # Reduced from 120 for faster responses
+CONNECTION_TIMEOUT = 10  # Reduced from 30 for faster connection
 
-# Simple in-memory cache for expensive aggregations (e.g., tools listing)
+# Connection pooling session for better performance
+_session = None
+_session_lock = threading.Lock()
+
+def get_requests_session():
+    """Get a shared requests session with connection pooling and retry logic."""
+    global _session
+    if _session is None:
+        with _session_lock:
+            if _session is None:
+                _session = requests.Session()
+                
+                # Configure retry strategy
+                retry_strategy = Retry(
+                    total=2,  # Reduced retries for faster response
+                    backoff_factor=0.1,
+                    status_forcelist=[429, 500, 502, 503, 504],
+                )
+                
+                # Mount adapters with connection pooling
+                adapter = HTTPAdapter(
+                    max_retries=retry_strategy,
+                    pool_connections=20,
+                    pool_maxsize=100
+                )
+                _session.mount("http://", adapter)
+                _session.mount("https://", adapter)
+                
+    return _session
+
+# Enhanced in-memory cache for expensive aggregations
 _TOOLS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-TOOLS_CACHE_TTL_SECONDS = int(os.getenv('TOOLS_CACHE_TTL_SECONDS', '120'))  # 2 minutes default
+_SERVERS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+TOOLS_CACHE_TTL_SECONDS = int(os.getenv('TOOLS_CACHE_TTL_SECONDS', '300'))  # Increased to 5 minutes
+SERVERS_CACHE_TTL_SECONDS = int(os.getenv('SERVERS_CACHE_TTL_SECONDS', '600'))  # 10 minutes
 # Limit initial aggregation size to reduce cold connect latency (tunable)
-TOOLS_MAX_APPS = int(os.getenv('TOOLS_MAX_APPS', '25'))
+TOOLS_MAX_APPS = int(os.getenv('TOOLS_MAX_APPS', '15'))  # Reduced for faster loading
+
+# In-memory allowlist of apps the user wants enabled (managed via /openapi/apps/allowed)
+_ALLOWED_APPS: set[str] = set()
+# Allowlist by MCP server id (from backend API v3 mcp servers)
+_ALLOWED_SERVERS: set[str] = set()
+_ENABLED_TOOLKITS: set[str] = set()
 
 # Add performance headers to all responses
 @app.after_request
@@ -125,29 +168,71 @@ def extract_api_key_from_request():
         return None
 
 
-def _get_with_auth(path: str, api_key: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
-    """Helper to GET from Composio with x-api-key and standard timeouts."""
-    url = f"{COMPOSIO_BASE_URL}{path if path.startswith('/') else '/' + path}"
+def _get_with_auth(path: str, api_key: str, params: Optional[Dict[str, Any]] = None, *, base: Optional[str] = None) -> requests.Response:
+    """Helper to GET from Composio with x-api-key and standard timeouts.
+    Set base to override host (e.g., backend).
+    Uses connection pooling for better performance.
+    """
+    root = base or COMPOSIO_BASE_URL
+    url = f"{root}{path if path.startswith('/') else '/' + path}"
     headers = {
         'x-api-key': api_key,
-        # propagate a minimal set of client hints for troubleshooting
         'X-Client': 'composio-proxy',
+        'Connection': 'keep-alive',  # Reuse connections
     }
-    return requests.get(url, headers=headers, params=params, timeout=(CONNECTION_TIMEOUT, REQUEST_TIMEOUT))
+    session = get_requests_session()
+    return session.get(url, headers=headers, params=params, timeout=(CONNECTION_TIMEOUT, REQUEST_TIMEOUT))
 
+
+@lru_cache(maxsize=32)
+def _get_cached_servers(api_key_hash: str, base_url: str) -> Dict[str, Any]:
+    """Cache MCP servers list with LRU cache."""
+    try:
+        resp = _get_with_auth('/api/v3/mcp/servers', api_key_hash, base=base_url)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        logger.warning(f"Failed to fetch servers: {e}")
+    return {"items": []}
+
+
+def _apply_server_and_toolkit_filters(tools: List[Dict[str, Any]], api_key: str) -> List[Dict[str, Any]]:
+    """Apply server and toolkit filtering to tools list."""
+    if not _ALLOWED_SERVERS and not _ENABLED_TOOLKITS:
+        return tools
+    
+    # Apply server allowlist by toolkit membership
+    if _ALLOWED_SERVERS:
+        api_key_hash = api_key[:16]
+        servers_data = _get_cached_servers(api_key_hash, COMPOSIO_BACKEND_BASE)
+        allowed_toolkits_by_server = set()
+        for s in servers_data.get('items', []):
+            if str(s.get('id')).lower() in _ALLOWED_SERVERS:
+                for tk in (s.get('toolkits') or []):
+                    allowed_toolkits_by_server.add(str(tk).lower())
+        tools = [t for t in tools if ((t.get('toolkit') or {}).get('slug') or '').lower() in allowed_toolkits_by_server]
+    
+    # Apply direct toolkit filtering
+    if _ENABLED_TOOLKITS:
+        tools = [t for t in tools if ((t.get('toolkit') or {}).get('slug') or '').lower() in _ENABLED_TOOLKITS]
+    
+    return tools
 
 def _fetch_all_tools(api_key: str, max_apps: Optional[int] = None) -> Dict[str, Any]:
     """Aggregate tools across all apps into a single list compatible with older clients.
     Returns a dict like {"items": [...]}.
-    Uses a short-lived in-memory cache keyed by api_key.
+    Uses enhanced caching and connection pooling for better performance.
     """
     now = time.time()
-    cache_key = f"tools::{api_key[:6]}::{TOOLS_CACHE_TTL_SECONDS}::{max_apps or 'all'}"
+    cache_key = f"tools::{api_key[:8]}::{max_apps or 'all'}::{hash(tuple(sorted(_ALLOWED_APPS)))}"
     cached = _TOOLS_CACHE.get(cache_key)
     if cached and (now - cached[0]) < TOOLS_CACHE_TTL_SECONDS:
+        logger.debug(f"Using cached tools (age: {now - cached[0]:.1f}s)")
         return cached[1]
 
-    # 1) fetch apps
+    start_time = time.time()
+    
+    # 1) fetch apps with connection pooling
     apps_resp = _get_with_auth('/api/apps', api_key)
     if apps_resp.status_code != 200:
         raise InternalServerError(f"Upstream /api/apps returned {apps_resp.status_code}")
@@ -155,13 +240,21 @@ def _fetch_all_tools(api_key: str, max_apps: Optional[int] = None) -> Dict[str, 
     if isinstance(apps, dict) and 'items' in apps:
         apps_list = apps['items']
     else:
-        # Some deployments return a plain array
         apps_list = apps if isinstance(apps, list) else []
 
-    aggregated: List[Dict[str, Any]] = []
+    # Apply limits early to reduce processing
     if max_apps is not None and isinstance(max_apps, int) and max_apps > 0:
         apps_list = apps_list[:max_apps]
+        
+    # Pre-filter by allowed apps if set
+    if _ALLOWED_APPS:
+        apps_list = [app for app in apps_list 
+                    if (app.get('key') or app.get('slug') or '').lower() in _ALLOWED_APPS]
 
+    aggregated: List[Dict[str, Any]] = []
+    session = get_requests_session()
+    
+    # Use session with connection pooling for better performance
     for app in apps_list:
         app_key = app.get('key') or app.get('slug') or app.get('id')
         if not app_key:
@@ -169,7 +262,7 @@ def _fetch_all_tools(api_key: str, max_apps: Optional[int] = None) -> Dict[str, 
         try:
             tools_resp = _get_with_auth(f"/api/apps/{app_key}/tools/list", api_key)
             if tools_resp.status_code != 200:
-                logger.warning(f"Skipping tools for {app_key}: {tools_resp.status_code}")
+                logger.debug(f"Skipping tools for {app_key}: {tools_resp.status_code}")
                 continue
             tools_json = tools_resp.json()
             items = tools_json.get('items', []) if isinstance(tools_json, dict) else []
@@ -183,11 +276,15 @@ def _fetch_all_tools(api_key: str, max_apps: Optional[int] = None) -> Dict[str, 
                     }
             aggregated.extend(items)
         except Exception as e:
-            logger.warning(f"Error fetching tools for app {app_key}: {e}")
+            logger.debug(f"Error fetching tools for app {app_key}: {e}")
             continue
 
     result = {"items": aggregated}
     _TOOLS_CACHE[cache_key] = (now, result)
+    
+    fetch_duration = time.time() - start_time
+    logger.info(f"Fetched {len(aggregated)} tools from {len(apps_list)} apps in {fetch_duration:.2f}s")
+    
     return result
 
 def sanitize_headers_for_logging(headers):
@@ -389,8 +486,14 @@ def v1_models_endpoint():
 
 @app.route('/openapi.tools.json', methods=['GET', 'OPTIONS'])
 def dynamic_tools_openapi():
-    """Dynamically generate an OpenAPI spec exposing each Composio tool as a POST endpoint.
-    This allows Open WebUI (OpenAPI-only tools) to list and call tools directly.
+    """Dynamically generate an OpenAPI spec exposing Composio tools.
+    Filtering supported via query params:
+      - apps: comma-separated app keys (e.g., apps=github,notion)
+      - q: search query (matches slug/name/description)
+      - max: max number of tools (default 100)
+      - mode: per-tool (default) or generic (mode=generic)
+        - per-tool: one POST per tool at /openapi/tools/{slug}
+        - generic: single POST /openapi/tools/invoke with body {name, args}
     """
     if request.method == 'OPTIONS':
         return '', 200
@@ -400,43 +503,177 @@ def dynamic_tools_openapi():
         return jsonify({"error": "Authentication required", "message": "Provide API key in Authorization: Bearer <key> header"}), 401
 
     try:
+        # Parse filters
+        apps_param = request.args.get('apps', '').strip()
+        apps_filter = [a.strip().lower() for a in apps_param.split(',') if a.strip()] if apps_param else []
+        q = (request.args.get('q') or '').strip().lower()
+        try:
+            max_tools = int(request.args.get('max', '100'))
+        except Exception:
+            max_tools = 100
+        mode = (request.args.get('mode') or 'per-tool').lower()
+
         tools = _fetch_all_tools(api_key, max_apps=None).get('items', [])
+        if _ALLOWED_APPS:
+            tools = [t for t in tools if ((t.get('toolkit') or {}).get('slug') or '').lower() in _ALLOWED_APPS]
+        # Apply server and toolkit filtering
+        tools = _apply_server_and_toolkit_filters(tools, api_key)
+        
+        # Apply legacy apps allowlist if set
+        if _ALLOWED_APPS:
+            tools = [t for t in tools if ((t.get('toolkit') or {}).get('slug') or '').lower() in _ALLOWED_APPS]
+
+        def tool_matches(t: Dict[str, Any]) -> bool:
+            # app filter
+            tk = (t.get('toolkit') or {}).get('slug') or (t.get('toolkit') or {}).get('name') or ''
+            if apps_filter and (tk or '').lower() not in apps_filter:
+                return False
+            if not q:
+                return True
+            text = ' '.join([
+                str(t.get('slug') or ''),
+                str(t.get('name') or ''),
+                str(t.get('description') or ''),
+                str(tk or '')
+            ]).lower()
+            return q in text
+
+        filtered = [t for t in tools if tool_matches(t)]
+        if max_tools > 0:
+            filtered = filtered[:max_tools]
+
         base_url = request.url_root.rstrip('/')
         paths: Dict[str, Any] = {}
-        for t in tools:
-            slug = t.get('slug') or t.get('name')
-            if not slug:
-                continue
-            params_schema = t.get('input_parameters') or {"type": "object"}
-            resp_schema = t.get('output_parameters') or {"type": "object"}
-            op = {
-                "operationId": f"invoke_{slug.lower()}",
-                "summary": t.get('name') or slug,
-                "description": t.get('description') or f"Invoke {slug}",
-                "requestBody": {
-                    "required": True,
-                    "content": {
-                        "application/json": {
-                            "schema": params_schema
-                        }
-                    }
-                },
-                "responses": {
-                    "200": {
-                        "description": "Invocation result",
+
+        if mode == 'generic':
+            # One generic endpoint; schema accepts name and args
+            paths['/openapi/tools/invoke'] = {
+                "post": {
+                    "operationId": "invoke_tool",
+                    "summary": "Invoke a Composio tool by name",
+                    "requestBody": {
+                        "required": True,
                         "content": {
                             "application/json": {
-                                "schema": resp_schema
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string", "description": "Tool slug"},
+                                        "args": {"type": "object", "additionalProperties": True}
+                                    },
+                                    "required": ["name", "args"]
+                                }
                             }
                         }
                     },
-                    "default": {
-                        "description": "Error response",
-                        "content": {"application/json": {"schema": {"type": "object"}}}
+                    "responses": {
+                        "200": {"description": "Invocation result", "content": {"application/json": {"schema": {"type": "object"}}}},
+                        "default": {"description": "Error", "content": {"application/json": {"schema": {"type": "object"}}}}
                     }
                 }
             }
-            paths[f"/openapi/tools/{slug}"] = {"post": op}
+        else:
+            # Per-tool endpoints
+            for t in filtered:
+                slug = t.get('slug') or t.get('name')
+                if not slug:
+                    continue
+                params_schema = t.get('input_parameters') or {"type": "object"}
+                resp_schema = t.get('output_parameters') or {"type": "object"}
+                op = {
+                    "operationId": f"invoke_{slug.lower()}",
+                    "summary": t.get('name') or slug,
+                    "description": t.get('description') or f"Invoke {slug}",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": params_schema
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Invocation result",
+                            "content": {
+                                "application/json": {
+                                    "schema": resp_schema
+                                }
+                            }
+                        },
+                        "default": {
+                            "description": "Error response",
+                            "content": {"application/json": {"schema": {"type": "object"}}}
+                        }
+                    }
+                }
+                paths[f"/openapi/tools/{slug}"] = {"post": op}
+
+        # Management endpoints to control allowlist
+        paths['/openapi/apps'] = {
+            "get": {
+                "operationId": "list_apps",
+                "summary": "List available apps",
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}}
+            }
+        }
+        paths['/openapi/apps/allowed'] = {
+            "get": {
+                "operationId": "get_allowed_apps",
+                "summary": "Get enabled (allowed) apps",
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}}
+            },
+            "post": {
+                "operationId": "set_allowed_apps",
+                "summary": "Set enabled apps (replaces list)",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"apps": {"type": "array", "items": {"type": "string"}}}, "required": ["apps"]}}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}}
+            }
+        }
+        
+        # MCP Server management endpoints
+        paths['/openapi/mcp/servers'] = {
+            "get": {
+                "operationId": "list_mcp_servers",
+                "summary": "List user's MCP servers",
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}}
+            }
+        }
+        paths['/openapi/mcp/servers/allowed'] = {
+            "get": {
+                "operationId": "get_allowed_servers",
+                "summary": "Get enabled MCP servers",
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}}
+            },
+            "post": {
+                "operationId": "set_allowed_servers",
+                "summary": "Enable specific MCP servers",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"servers": {"type": "array", "items": {"type": "string"}}}, "required": ["servers"]}}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}}
+            }
+        }
+        
+        # Toolkit management endpoints
+        paths['/openapi/toolkits'] = {
+            "get": {
+                "operationId": "list_toolkits",
+                "summary": "List available toolkits",
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}}
+            }
+        }
+        paths['/openapi/toolkits/allowed'] = {
+            "get": {
+                "operationId": "get_allowed_toolkits",
+                "summary": "Get enabled toolkits",
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}}
+            },
+            "post": {
+                "operationId": "set_allowed_toolkits",
+                "summary": "Enable specific toolkits",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"toolkits": {"type": "array", "items": {"type": "string"}}}, "required": ["toolkits"]}}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}}
+            }
+        }
 
         spec = {
             "openapi": "3.1.0",
@@ -452,6 +689,215 @@ def dynamic_tools_openapi():
     except Exception as e:
         logger.error(f"Failed to generate tools OpenAPI: {e}")
         return jsonify({"error": "Failed to generate OpenAPI", "message": str(e)}), 500
+
+
+@app.route('/openapi/tools/<slug>', methods=['POST', 'OPTIONS'])
+def openapi_tool_invoke(slug: str):
+    """Invoke a specific tool by slug, translating to Composio execute endpoint.
+    We infer the app key from the tool's toolkit.slug; if not found, return error.
+    """
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    api_key = extract_api_key_from_request() or DEFAULT_API_KEY
+    if not api_key:
+        return jsonify({"error": "Authentication required", "message": "Provide API key in Authorization: Bearer <key> header"}), 401
+
+    try:
+        name_override = None
+        if request.path.endswith('/invoke'):
+            # Not used here; kept for future generic path pattern
+            pass
+
+        # Find tool metadata
+        tools = _fetch_all_tools(api_key, max_apps=None).get('items', [])
+        # Apply server and toolkit filtering
+        tools = _apply_server_and_toolkit_filters(tools, api_key)
+        
+        # Apply legacy apps allowlist if set
+        if _ALLOWED_APPS:
+            tools = [t for t in tools if ((t.get('toolkit') or {}).get('slug') or '').lower() in _ALLOWED_APPS]
+        tool = next((t for t in tools if (t.get('slug') or '').lower() == slug.lower()), None)
+        if not tool:
+            return jsonify({"error": "Not found", "message": f"Tool '{slug}' not found"}), 404
+        toolkit = tool.get('toolkit') or {}
+        app_key = toolkit.get('slug') or toolkit.get('name')
+        if not app_key:
+            return jsonify({"error": "Unknown app", "message": f"No app/toolkit info for tool '{slug}'"}), 400
+
+        # Forward to assumed Composio execute endpoint
+        target = f"{COMPOSIO_BASE_URL}/api/apps/{app_key}/tools/{slug}/execute"
+        headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+        upstream = requests.post(target, headers=headers, data=request.data, timeout=(CONNECTION_TIMEOUT, REQUEST_TIMEOUT))
+        # Pass through status and JSON body
+        try:
+            body = upstream.json()
+        except Exception:
+            body = {"raw": upstream.text}
+        return make_response(jsonify(body), upstream.status_code)
+    except Exception as e:
+        logger.error(f"Tool invoke failed for {slug}: {e}")
+        return jsonify({"error": "Invoke failed", "message": str(e)}), 500
+
+
+@app.route('/openapi/apps', methods=['GET'])
+def openapi_list_apps():
+    api_key = extract_api_key_from_request() or DEFAULT_API_KEY
+    if not api_key:
+        return jsonify({"error": "Authentication required"}), 401
+    try:
+        resp = _get_with_auth('/api/apps', api_key)
+        return make_response(resp.json(), resp.status_code)
+    except Exception as e:
+        logger.error(f"List apps failed: {e}")
+        return jsonify({"error": "Failed", "message": str(e)}), 500
+
+
+@app.route('/openapi/mcp/servers', methods=['GET'])
+def openapi_list_mcp_servers():
+    api_key = extract_api_key_from_request() or DEFAULT_API_KEY
+    if not api_key:
+        return jsonify({"error": "Authentication required"}), 401
+    try:
+        resp = _get_with_auth('/api/v3/mcp/servers', api_key, base=COMPOSIO_BACKEND_BASE)
+        return make_response(resp.json(), resp.status_code)
+    except Exception as e:
+        logger.error(f"List MCP servers failed: {e}")
+        return jsonify({"error": "Failed", "message": str(e)}), 500
+
+
+@app.route('/openapi/mcp/servers/allowed', methods=['GET', 'POST', 'OPTIONS'])
+def openapi_allowed_mcp_servers():
+    """Manage allowed MCP servers for tool filtering."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    if request.method == 'GET':
+        return jsonify({"servers": sorted(list(_ALLOWED_SERVERS))})
+    payload = request.get_json(silent=True) or {}
+    servers = payload.get('servers') or []
+    if not isinstance(servers, list):
+        return jsonify({"error": "Invalid body", "message": "servers must be an array"}), 400
+    global _ALLOWED_SERVERS
+    _ALLOWED_SERVERS = set([str(s).lower() for s in servers if str(s).strip()])
+    logger.info(f"Updated allowed servers: {sorted(list(_ALLOWED_SERVERS))}")
+    return jsonify({"ok": True, "servers": sorted(list(_ALLOWED_SERVERS))})
+
+
+@app.route('/openapi/toolkits', methods=['GET'])
+def openapi_list_toolkits():
+    """List all available toolkits from user's MCP servers."""
+    api_key = extract_api_key_from_request() or DEFAULT_API_KEY
+    if not api_key:
+        return jsonify({"error": "Authentication required"}), 401
+    try:
+        # Get user's MCP servers
+        servers_resp = _get_with_auth('/api/v3/mcp/servers', api_key, base=COMPOSIO_BACKEND_BASE)
+        if servers_resp.status_code != 200:
+            return jsonify({"error": "Failed to fetch servers"}), servers_resp.status_code
+        
+        servers_data = servers_resp.json()
+        toolkits = set()
+        server_toolkit_map = {}
+        
+        for server in servers_data.get('items', []):
+            server_id = str(server.get('id', ''))
+            server_name = server.get('name', f"Server {server_id}")
+            server_toolkits = server.get('toolkits', [])
+            
+            for toolkit in server_toolkits:
+                toolkit_name = str(toolkit).lower()
+                toolkits.add(toolkit_name)
+                if toolkit_name not in server_toolkit_map:
+                    server_toolkit_map[toolkit_name] = []
+                server_toolkit_map[toolkit_name].append({
+                    'id': server_id,
+                    'name': server_name
+                })
+        
+        return jsonify({
+            "toolkits": sorted(list(toolkits)),
+            "server_toolkit_map": server_toolkit_map
+        })
+    except Exception as e:
+        logger.error(f"List toolkits failed: {e}")
+        return jsonify({"error": "Failed", "message": str(e)}), 500
+
+
+@app.route('/openapi/toolkits/allowed', methods=['GET', 'POST', 'OPTIONS'])
+def openapi_allowed_toolkits():
+    """Manage allowed toolkits for tool filtering."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    if request.method == 'GET':
+        return jsonify({"toolkits": sorted(list(_ENABLED_TOOLKITS))})
+    payload = request.get_json(silent=True) or {}
+    toolkits = payload.get('toolkits') or []
+    if not isinstance(toolkits, list):
+        return jsonify({"error": "Invalid body", "message": "toolkits must be an array"}), 400
+    global _ENABLED_TOOLKITS
+    _ENABLED_TOOLKITS = set([str(t).lower() for t in toolkits if str(t).strip()])
+    logger.info(f"Updated enabled toolkits: {sorted(list(_ENABLED_TOOLKITS))}")
+    return jsonify({"ok": True, "toolkits": sorted(list(_ENABLED_TOOLKITS))})
+
+
+@app.route('/openapi/apps/allowed', methods=['GET', 'POST', 'OPTIONS'])
+def openapi_allowed_apps():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if request.method == 'GET':
+        return jsonify({"apps": sorted(list(_ALLOWED_APPS))})
+    payload = request.get_json(silent=True) or {}
+    apps = payload.get('apps') or []
+    if not isinstance(apps, list):
+        return jsonify({"error": "Invalid body", "message": "apps must be an array"}), 400
+    global _ALLOWED_APPS
+    _ALLOWED_APPS = set([str(a).lower() for a in apps if str(a).strip()])
+    return jsonify({"ok": True, "apps": sorted(list(_ALLOWED_APPS))})
+
+
+@app.route('/openapi/tools/invoke', methods=['POST', 'OPTIONS'])
+def openapi_tool_invoke_generic():
+    """Generic invoke endpoint used when mode=generic is chosen in the OpenAPI spec."""
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    api_key = extract_api_key_from_request() or DEFAULT_API_KEY
+    if not api_key:
+        return jsonify({"error": "Authentication required", "message": "Provide API key in Authorization: Bearer <key> header"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    name = (payload.get('name') or '').strip()
+    args = payload.get('args') or {}
+    if not name:
+        return jsonify({"error": "Invalid request", "message": "Missing tool 'name'"}), 400
+
+    try:
+        tools = _fetch_all_tools(api_key, max_apps=None).get('items', [])
+        # Apply server and toolkit filtering
+        tools = _apply_server_and_toolkit_filters(tools, api_key)
+        
+        # Apply legacy apps allowlist if set
+        if _ALLOWED_APPS:
+            tools = [t for t in tools if ((t.get('toolkit') or {}).get('slug') or '').lower() in _ALLOWED_APPS]
+        tool = next((t for t in tools if (t.get('slug') or '').lower() == name.lower()), None)
+        if not tool:
+            return jsonify({"error": "Not found", "message": f"Tool '{name}' not found"}), 404
+        toolkit = tool.get('toolkit') or {}
+        app_key = toolkit.get('slug') or toolkit.get('name')
+        if not app_key:
+            return jsonify({"error": "Unknown app", "message": f"No app/toolkit info for tool '{name}'"}), 400
+
+        target = f"{COMPOSIO_BASE_URL}/api/apps/{app_key}/tools/{name}/execute"
+        headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+        upstream = requests.post(target, headers=headers, json=args, timeout=(CONNECTION_TIMEOUT, REQUEST_TIMEOUT))
+        try:
+            body = upstream.json()
+        except Exception:
+            body = {"raw": upstream.text}
+        return make_response(jsonify(body), upstream.status_code)
+    except Exception as e:
+        logger.error(f"Generic tool invoke failed: {e}")
+        return jsonify({"error": "Invoke failed", "message": str(e)}), 500
 
 
 @app.route('/openapi/tools/<slug>', methods=['POST', 'OPTIONS'])
@@ -562,8 +1008,9 @@ def proxy_request(path=''):
             request_data = request.data
             logger.debug(f"Request body length: {len(request_data)} bytes")
         
-        # Make request to Composio API with streaming
-        response = requests.request(
+        # Make request to Composio API with streaming and connection pooling
+        session = get_requests_session()
+        response = session.request(
             method=request.method,
             url=target_url,
             headers=headers,
